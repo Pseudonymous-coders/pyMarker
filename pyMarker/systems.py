@@ -1,8 +1,10 @@
-from sys import platform as _platforms, exit
-from platform import architecture
-from subprocess import Popen, PIPE
-from signal import signal, SIGINT
+from os import environ, ctermid, close, open, O_RDONLY
 from os.path import dirname, realpath
+from platform import architecture
+from re import sub
+from signal import signal, SIGINT
+from subprocess import Popen, PIPE, STDOUT
+from sys import platform as _platforms, exit, stdout
 
 
 class WaterMarkerException(Exception):
@@ -22,7 +24,12 @@ def handle_exit(code, frame):
 class System:
     def __init__(self):
         self.system = None
+        self.frames = 2000
+        self.timeout_seconds = 4
         self.verbosity = 3
+        self.is_ide = "PYCHARM_HOSTED" in environ
+        if self.is_ide:
+            print("Running script in IDE! simple debug enabled")
         signal(SIGINT, handle_exit)
 
     def report_error(self, mess, num=1):
@@ -32,16 +39,98 @@ class System:
         if self.verbosity >= num if not equal else num == self.verbosity:
             print(mess)
 
+    @staticmethod
+    def print_progress(iteration, total, prefix='', suffix='', decimals=2, bar_length=100):
+        filled_length = int(round(bar_length * iteration / float(total)))
+        percents = round(100.00 * (iteration / float(total)), decimals)
+        bar = '#' * filled_length + '-' * (bar_length - filled_length)
+        stdout.write('%s [%s] %s%s %s\r' % (prefix, bar, percents, '%', suffix)),
+        stdout.flush()
+        if iteration == total:
+            print("\n")
+
+    def term_width(self):
+        env = environ
+
+        def ioctl_win(fd):
+            try:
+                import fcntl, termios, struct, os
+                cr = struct.unpack('hh', fcntl.ioctl(fd, termios.TIOCGWINSZ,
+                                                     '1234'))[1]
+            except (OSError, ValueError, IndexError, IOError, TypeError):
+                return
+            return cr
+
+        cr = ioctl_win(0) or ioctl_win(1) or ioctl_win(2)
+        if not cr:
+            try:
+                fd = open(ctermid(), O_RDONLY)
+                cr = ioctl_win(fd)
+                close(fd)
+            except (OSError, ValueError, IndexError, IOError, TypeError):
+                pass
+        if not cr:
+            cr = env.get('COLUMNS', 80)  # (env.get('LINES', 25), env.get('COLUMNS', 80))
+        self.verbo_print("Terminal width: %d" % int(cr), 3)
+        return int(cr)  # int(cr[1]), int(cr[0])
+
     def command(self, com, ret_err=0, err_text=None):
         if not len(str(com)) > 0:
             return [False, ""]
+        ff = False
+        if "-vf" in com and "[in]" in com and "overlay" in com:
+            self.verbo_print("Preparing command for ffmpeg", 3)
+            ff = True
         com_list = str(com)  # .strip(" ").split(" ") if not isinstance(com, list) else com
         try:
-            child = Popen(com_list, stderr=PIPE, stdout=PIPE, shell=True)
-            communicate = child.communicate()
+            if not ff:
+                child = Popen(com_list, stderr=PIPE, stdout=PIPE, shell=True)
+            else:
+                child = Popen(com_list, stderr=STDOUT, stdout=PIPE, shell=True)
+            communicate = (" ", " ")
             try:
-                stream = (communicate[1] + communicate[0]) if communicate[1][0] is not None else communicate[0]
-            except IndexError:
+                if not ff:
+                    communicate = child.communicate()
+                    stream = (communicate[1] + communicate[0]) if communicate[1][0] is not None else communicate[0]
+                else:
+                    stream = " "
+                    terminal_width = self.term_width() - 20
+                    #terminal_width = terminal_width if terminal_width > 50 else 50
+                    self.print_progress(0, 100, "Processing", "Complete", terminal_width)
+                    while True:
+                        output = ""
+                        while True:
+                            if child.poll() is not None:
+                                break
+                            output += child.stdout.read(1)
+                            if "\r" in output[-1:] or "\n" in output[-1:] or child.poll() is not None:
+                                break
+                        if output == "" and child.poll() is not None:
+                            # stdout.write("")
+                            stdout.flush()
+                            break
+                        if output:
+                            out = output.strip()
+                            if self.verbosity >= 3:
+                                print(out)
+                            stream += out
+                            try:
+                                if out == "\n":
+                                    continue
+                                if "frame" in out and "fps" in out:
+                                    frame_str = out[out.index("frame") + 5:out.index("fps")]
+                                    frame = float(sub("[^0-9 .]", "", str(frame_str)))
+                                    if self.verbosity > 0 and float((frame / self.frames)) < 99:
+                                        if not self.is_ide:
+                                            self.print_progress(int((frame / self.frames) * 100),
+                                                                100, "Processing", "Complete", terminal_width)
+                                        else:
+                                            print("\rProcessing: {0}%".format(int((frame/self.frames) * 100))),
+
+                            except (ValueError, IndexError):
+                                pass
+
+            except (IndexError, ValueError):
                 stream = communicate[0]
             code = child.returncode
         except OSError, err:
@@ -50,6 +139,8 @@ class System:
             else:
                 self.report_error(err.strerror)
             return [False, "HANDLE"]
+        if not self.is_ide:
+            print("\n")
         if err_text is not None:
             if err_text in str(stream):
                 return [False, ""]
@@ -76,6 +167,9 @@ class System:
         if "64" in arch or "x86_64" in arch:
             arch = "64/"
         else:
+            if self.system == 1:
+                self.report_error("32bit Mac ffmpeg is currently not supported sorry!")
+                exit(1)
             arch = "32/"
         return "%s/%s" % (folder, arch if self.system != 2 else (arch + "bin/"))
 
@@ -84,6 +178,13 @@ class System:
         executable = "ffmpeg" if self.system != 2 else "ffmpeg.exe"
         working = folder + executable + " " + str(args)
         self.verbo_print("Working ffmpeg: %s" % working, 2)
+        return self.command(working, ret_err, err_text)
+
+    def ffprobe(self, args, ret_err=0, err_text=None):
+        folder = self.get_ffmpeg_folder()
+        executable = "ffprobe" if self.system != 2 else "ffprobe.exe"
+        working = folder + executable + " " + str(args)
+        self.verbo_print("Working ffprobe: %s" % working, 2)
         return self.command(working, ret_err, err_text)
 
     def exif(self, args, ret_err=0, err_text=None):
